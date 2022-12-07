@@ -1,4 +1,5 @@
 from sqlalchemy import create_engine, text
+from sqlalchemy.pool import NullPool
 from config import *
 import logging
 import traceback
@@ -6,28 +7,30 @@ import traceback
 
 class NiftyDB:
     def __init__(self):
-        self.db = create_engine(f"{DB_TYPE}+{DB_ENGINE}://{DB_USERNAME}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/{DB_NAME}")
+        self.db = create_engine(f"{DB_TYPE}+{DB_ENGINE}://{DB_USERNAME}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/{DB_NAME}",
+                                poolclass=NullPool)
+        self.db = create_engine(f"sqlite:///niftyDB.db", poolclass=NullPool)
 
 
     #############################
     # GETS
     #############################
 
-    def get_user_info(self, accountId=None, address=None, username=None):
-        with self.db.connect() as conn:
-            if address is not None:
-                result = conn.execute(text("SELECT * FROM users WHERE address=:address"), address=address)
-            elif accountId is not None:
-                result = conn.execute(text("SELECT * FROM users WHERE accountId=:accountId"), accountId=accountId)
-            elif username is not None:
-                result = conn.execute(text("SELECT * FROM users WHERE username=:username"), username=username)
+    def get_user_info(self, conn, accountId=None, address=None, username=None):
 
-            result = result.fetchone()
+        if address is not None:
+            result = conn.execute(text("SELECT * FROM users WHERE address=:address"), address=address)
+        elif accountId is not None:
+            result = conn.execute(text("SELECT * FROM users WHERE accountId=:accountId"), accountId=accountId)
+        elif username is not None:
+            result = conn.execute(text("SELECT * FROM users WHERE username=:username"), username=username)
 
-            if result is None:
-                return None, None, None
-            else:
-                return result['accountid'], result['address'], result['username']
+        result = result.fetchone()
+
+        if result is None:
+            return None, None, None
+        else:
+            return result['accountid'], result['address'], result['username']
 
     def get_discord_server_stats(self, serverId):
         with self.db.connect() as conn:
