@@ -15,3 +15,9 @@ DB_NAME = 'niftyDB'
 LR_API_KEYS = [""]
 LR_RETRY_ATTEMPTS = 5
 LR_RETRY_DELAY = 1
+
+############
+# Gamestop #
+############
+GS_RETRY_ATTEMPTS = 5
+GS_RETRY_DELAY = 1

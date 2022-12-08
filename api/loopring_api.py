@@ -8,7 +8,6 @@ import traceback
 import asyncio
 import time
 from nifty_database import NiftyDB
-#from gamestop_api import User
 from random import choice
 from config import *
 
