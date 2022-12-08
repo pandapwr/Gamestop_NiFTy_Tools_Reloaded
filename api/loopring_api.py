@@ -12,10 +12,8 @@ from nifty_database import NiftyDB
 from random import choice
 from config import *
 
-def async_run(func):
-    return asyncio.run(func)
 
-class LoopringAPI(object):
+class LoopringAPI:
     def __init__(self):
         self.headers = {
             'Accept': 'application/json',
@@ -129,35 +127,208 @@ class LoopringAPI(object):
                 if verbose:
                     logging.info(f"Retrieved {index} of {total_holders} NFT holders.")
 
+            accountId_list = ', '.join(['\'%s\'' % w['accountId'] for w in holders_list])
+
+            query = f"SELECT * FROM users WHERE accountId IN ({accountId_list})"
             nf = NiftyDB()
             with nf.db.connect() as conn:
+                account_list = conn.execute(query.format(accountId_list=accountId_list)).fetchall()
 
-                with ThreadPoolExecutor(max_workers=30) as executor:
-                    async def check_db_for_user_info(conn, accountId, amount):
-                        nf = NiftyDB()
-                        _, address, username = nf.get_user_info(conn, accountId=accountId)
-                        print(f"Checking DB for {accountId} - {address} - {username}")
-                        if username is not None:
-                            return {'address': address, 'user': username, 'accountId': accountId, 'amount': int(amount)}
-                        else:
-                            address = self.get_user_address(accountId)
-                            username = "Null"
-                            return {'address': address, 'user': username, 'accountId': accountId, 'amount': int(amount)}
+            account_dict = {}
+            for account in account_list:
+                account_dict[account['accountid']] = {'address': account['address'], 'username': account['username']}
 
-                    #tasks = [executor.submit(async_run(check_db_for_user_info(holder['accountId'], holder['amount']))) for holder in holders_list]
-                    tasks = [check_db_for_user_info(conn, holder['accountId'], holder['amount']) for holder in holders_list]
-                    holders_list = []
-                    for result in executor.map(async_run, tasks):
-                        holders_list.append({'user': result['user'], 'address': result['address'],
-                                             'accountId': result['accountId'], 'amount': result['amount']})
+            holders = []
+            for holder in holders_list:
+                if holder['accountId'] in account_dict:
+                    holders.append({'address': account_dict[holder['accountId']]['address'],
+                                    'username': account_dict[holder['accountId']]['username'],
+                                    'amount': holder['amount']})
 
-                return total_holders, holders_list
+            return total_holders, holders
+
+    @sleep_and_retry
+    @limits(calls=5, period=1)
+    async def get_user_nft_balance(self, accountId):
+        """
+        Get the user's NFT balance.
+        :param str accountId: User's accountId
+        :return: List of NFTs owned by user
+        :rtype: List
+        """
+
+        offset = 0
+        data = []
+        retrieved_all = False
+
+        async with aiohttp.ClientSession(headers=self.headers) as session:
+            while not retrieved_all:
+                api_url = f"https://api3.loopring.io/api/v3/user/nft/balances?accountId={accountId}&offset={offset}&limit=50"
+                for i in range(LR_RETRY_ATTEMPTS):
+                    async with session.get(api_url) as response:
+                        if response.status == 200:
+                            response = await response.json()
+                            if response['totalNum'] == 0:
+                                retrieved_all = True
+                            else:
+                                data.extend(response['data'])
+                            offset += 50
+                            break
+                    await asyncio.sleep(LR_RETRY_DELAY)
+
+        return data
+
+    @sleep_and_retry
+    @limits(calls=5, period=1)
+    async def get_block(self, blockId):
+        """
+        Get the block details for a given blockId
+        :param str blockId: Block ID to get details for
+        :return: Block details
+        :rtype: dict
+        """
+        async with aiohttp.ClientSession(headers=self.headers) as session:
+            api_url = f"https://api3.loopring.io/api/v3/block/getBlock?blockId={blockId}"
+            async with session.get(api_url) as response:
+                if response.status == 200:
+                    response = await response.json()
+                    return response
+                else:
+                    logging.error(f"Error getting block details: {response.status}")
+                    return None
+
+    async def get_pending(self, spot_trades=True, transfers=True, mints=True):
+        """
+        Get pending transactions
+        :param bool spot_trades: Get pending spot trades
+        :param bool transfers: Get pending transfers
+        :param bool mints: Get pending mints
+        :return: List of pending transactions
+        :rtype: list
+        """
+
+        async with aiohttp.ClientSession(headers=self.headers) as session:
+            api_url = f"https://api3.loopring.io/api/v3/block/getPendingRequests"
+            nft_txs = dict()
+            nft_txs['transactions'] = []
+            async with session.get(api_url) as response:
+                if response.status == 200:
+                    response = await response.json()
+                    if spot_trades:
+                        spot_trades = [tx for tx in response if tx['txType'] == 'SpotTrade']
+                        spot_trades_nft = [tx for tx in spot_trades if tx['orderA']['nftData'] != '']
+                        nft_txs['transactions'].extend(spot_trades_nft)
+
+                    if transfers:
+                        transfers = [tx for tx in response if tx['txType'] == 'Transfer']
+                        transfers_nft = [tx for tx in transfers if tx['token']['nftData'] != '']
+                        nft_txs['transactions'].extend(transfers_nft)
+
+                    if mints:
+                        mints = [tx for tx in response if tx['txType'] == 'NftMint']
+                        mints_nft = [tx for tx in mints if tx['nftToken']['nftData'] != '']
+                        nft_txs['transactions'].extend(mints_nft)
+                    return nft_txs
+                else:
+                    logging.error(f"Error getting pending transactions: {response.status}")
+                    return None
+
+    async def filter_nft_txs(self, blockId):
+        """
+        Filter NFT transactions from a block
+        :param int blockId: Block ID to filter
+        :return: Block dict with block details and NFT transactions
+        :rtype: dict
+        """
+        print(f"Processing block {blockId}")
+        block_txs = await self.get_block(blockId)
+        nft_txs = dict()
+        nft_txs['blockId'] = blockId
+        nft_txs['createdAt'] = block_txs['createdAt']
+        nft_txs['transactions'] = []
+
+        spot_trades = [tx for tx in block_txs['transactions'] if tx['txType'] == 'SpotTrade']
+        spot_trades_nft = [tx for tx in spot_trades if tx['orderA']['nftData'] != '']
+        nft_txs['transactions'].extend(spot_trades_nft)
+
+        transfers = [tx for tx in block_txs['transactions'] if tx['txType'] == 'Transfer']
+        transfers_nft = [tx for tx in transfers if tx['token']['nftData'] != '']
+        nft_txs['transactions'].extend(transfers_nft)
+
+        mints = [tx for tx in block_txs['transactions'] if tx['txType'] == 'NftMint']
+        mints_nft = [tx for tx in mints if tx['nftToken']['nftData'] != '']
+        nft_txs['transactions'].extend(mints_nft)
+
+        return nft_txs
+
+    async def save_nft_tx(self, blockData):
+        """
+        Save NFT transactions to database
+        :param dict blockData: Block data
+        :return: None
+        """
+
+        nf = NiftyDB()
+
+        block_price_eth = await nf.get_historical_price('ETH', int(blockData['createdAt'] / 1000))
+        block_price_lrc = await nf.get_historical_price('LRC', int(blockData['createdAt'] / 1000))
+        if block_price_eth is None or block_price_lrc is None:
+            logging.error(f"Error getting historical price for block {blockData['blockId']}")
+            return None
+
+        if nf.check_if_block_exists(blockData['blockId']):
+            logging.info(f"Block {blockData['blockId']} already exists in database")
+            return None
+
+        created = int(blockData['createdAt'] / 1000)
+        for tx in blockData['transactions']:
+            if tx['txType'] == 'SpotTrade':
+                # Check to see if transaction was done using LRC
+                if tx['orderA']['tokenS'] == 1:
+                    price_lrc = float(tx['orderA']['amountS']) / 10 ** 18 / float(tx['orderA']['amountB'])
+                    price_usd = round(price_lrc * block_price_lrc, 2)
+                    price_eth = round(price_usd / block_price_eth, 4)
+                else:
+                    price_eth = float(tx['orderA']['amountS']) / 10 ** 18 / float(tx['orderA']['amountB'])
+                    price_usd = round(price_eth * block_price_eth, 2)
+                nf.insert_transaction(blockData['blockId'], created, tx['txType'],
+                                      tx['orderA']['nftData'], tx['orderB']['accountID'], tx['orderA']['accountID'],
+                                      tx['orderB']['fillS'], price_eth, price_usd)
+            elif tx['txType'] == 'Transfer':
+                nf.insert_transaction(blockData['blockId'], created, tx['txType'],
+                                      tx['token']['nftData'], tx['accountId'], tx['toAccountId'],
+                                      tx['token']['amount'], 0, 0)
+            elif tx['txType'] == 'NftMint':
+                nf.insert_transaction(blockData['blockId'], created, tx['txType'],
+                                      tx['nftToken']['nftData'], tx['minterAccountId'], tx['toAccountId'],
+                                      tx['nftToken']['amount'], 0, 0)
+
+        print(f"Saved block {blockData['blockId']} to database")
+
+    async def get_nft_info(self, nftData):
+        """
+        Get NFT info from Loopring API
+        :param str nftData: NFT data
+        :return: NFT info
+        :rtype: dict
+        """
+
+        async with aiohttp.ClientSession(headers=self.headers) as session:
+            api_url = "https://api3.loopring.io/api/v3/nft/info/nfts?nftDatas={nftData}"
+            async with session.get(api_url) as response:
+                if response.status == 200:
+                    response = await response.json()
+                    return response.json()[0]
+                else:
+                    logging.error(f"Error fetching NFT Info for {nftData}: {response.status}")
+                    return None
 
 
 if __name__ == "__main__":
     lrc = LoopringAPI()
     time_start = time.time()
-    total_holders, holders_list = asyncio.run(lrc.get_nft_holders("0x27665297fab3c72a472f81e6a734ffe81c8c1940a82164aca76476ca2b506724"))
-
-    print(holders_list)
+    asyncio.run(lrc.get_nft_holders("0x27665297fab3c72a472f81e6a734ffe81c8c1940a82164aca76476ca2b506724"))
+    #print(asyncio.run(lrc.get_user_nft_balance(92477)))
+    #print(asyncio.run(lrc.get_block(28000)))
+    #print(asyncio.run(lrc.filter_nft_txs(28000)))
     print(f"{time.time()- time_start} seconds")

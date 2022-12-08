@@ -9,14 +9,15 @@ class NiftyDB:
     def __init__(self):
         self.db = create_engine(f"{DB_TYPE}+{DB_ENGINE}://{DB_USERNAME}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/{DB_NAME}",
                                 poolclass=NullPool)
-        self.db = create_engine(f"sqlite:///niftyDB.db", poolclass=NullPool)
 
 
     #############################
     # GETS
     #############################
 
-    def get_user_info(self, conn, accountId=None, address=None, username=None):
+    def get_user_info(self, conn=None, accountId=None, address=None, username=None):
+        if conn is None:
+            conn = self.db.connect()
 
         if address is not None:
             result = conn.execute(text("SELECT * FROM users WHERE address=:address"), address=address)
@@ -391,6 +392,19 @@ class NiftyDB:
                 return True
             except Exception as e:
                 logging.error(f"Error inserting collection for {collectionId}: {e} {traceback.format_exc()}")
+                return False
+
+    #############################
+    # CHECKS
+    #############################
+
+    def check_if_block_exists(self, blockId):
+        with self.db.connect() as conn:
+            try:
+                result = conn.execute(text("SELECT blockId FROM transactions WHERE blockId=:blockId"), blockId=blockId).fetchone()
+                return result is not None
+            except Exception as e:
+                logging.error(f"Error checking if block exists for {blockId}: {e} {traceback.format_exc()}")
                 return False
 
 if __name__ == "__main__":

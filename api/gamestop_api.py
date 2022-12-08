@@ -1,7 +1,9 @@
 import aiohttp
 import json
+import asyncio
 import logging
 from datetime import datetime
+from nifty_database import NiftyDB
 import traceback
 
 GS_HEADERS = {
@@ -50,7 +52,7 @@ class GamestopApi:
                     async with session.get(api_url) as response:
                         if response.status == 200:
                             response = await response.json()
-                            data = response.json()['data']
+                            data = response['data']
                             collections_list.extend(data)
                             offset += limit
                             remaining -= limit
@@ -72,3 +74,66 @@ class GamestopApi:
 
             return collections_list
 
+    async def save_collections(self):
+        """
+        Saves all collections to the database
+        :returns:
+        """
+        nf = NiftyDB()
+        collections = await self.get_collections()
+
+        if collections is not None:
+            # Query DB for existing collections
+            collectionId_str = ', '.join(['\'%s\'' % collection['collectionId'] for collection in collections])
+            with nf.db.connect() as conn:
+                existing_collections = conn.execute(f"SELECT collectionid FROM collections WHERE collectionid IN ({collectionId_str})").fetchall()
+                existing_collections_list = [collection['collectionid'] for collection in existing_collections]
+
+            # Check which collections are new
+            new_collections = []
+            for collection in collections:
+                if collection['collectionId'] not in existing_collections_list:
+                    new_collections.append(collection)
+
+            # Insert new collections
+            for collection in new_collections:
+                async with aiohttp.ClientSession(headers=GS_HEADERS) as session:
+                    api_url = f"https://api.nft.gamestop.com/nft-svc-marketplace/getCollectionStats?collectionId={collection['collectionId']}"
+                    async with session.get(api_url) as response:
+                        if response.status == 200:
+                            response = await response.json()
+                            numNfts = response['itemCount']
+
+                    print(f"Adding {collection['name']} ({collection['collectionId']}) to database")
+                    if collection['bannerUri'] is None:
+                        bannerUri = ""
+                    else:
+                        bannerUri = f"https://static.gstop-content.com/{collection['bannerUri'][7:]}"
+
+                    if collection['avatarUri'] is None:
+                        avatarUri = ""
+                    else:
+                        avatarUri = f"https://static.gstop-content.com/{collection['avatarUri'][7:]}"
+
+                    if collection['tileUri'] is None:
+                        tileUri = ""
+                    else:
+                        tileUri = f"https://static.gstop-content.com/{collection['tileUri'][7:]}"
+
+                    nf.insert_collection(collection['collectionId'],
+                                         collection['name'],
+                                         collection['slug'],
+                                         collection['creator']['displayName'],
+                                         collection['description'],
+                                         bannerUri,
+                                         avatarUri,
+                                         tileUri,
+                                         int(collection['createdAt'].timestamp()),
+                                         numNfts,
+                                         collection['layer'])
+
+
+
+if __name__ == "__main__":
+    api = GamestopApi()
+    asyncio.run(api.save_collections())
