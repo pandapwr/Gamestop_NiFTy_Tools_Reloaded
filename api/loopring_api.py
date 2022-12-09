@@ -2,7 +2,6 @@ import aiohttp
 import json
 import logging
 from ratelimit import limits, sleep_and_retry
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 import traceback
 import asyncio
@@ -131,7 +130,7 @@ class LoopringAPI:
             query = f"SELECT * FROM users WHERE accountId IN ({accountId_list})"
             nf = NiftyDB()
             with nf.db.connect() as conn:
-                account_list = conn.execute(query.format(accountId_list=accountId_list)).fetchall()
+                account_list = conn.execute(query).fetchall()
 
             account_dict = {}
             for account in account_list:
@@ -161,19 +160,39 @@ class LoopringAPI:
         retrieved_all = False
 
         async with aiohttp.ClientSession(headers=self.headers) as session:
-            while not retrieved_all:
-                api_url = f"https://api3.loopring.io/api/v3/user/nft/balances?accountId={accountId}&offset={offset}&limit=50"
-                for i in range(LR_RETRY_ATTEMPTS):
+            api_url = f"https://api3.loopring.io/api/v3/user/nft/balances?accountId={accountId}&offset={offset}&limit=50"
+            for i in range(LR_RETRY_ATTEMPTS):
+                async with session.get(api_url) as response:
+                    if response.status == 200:
+                        response = await response.json()
+                        if response['totalNum'] == 0:
+                            retrieved_all = True
+                        else:
+                            data.extend(response['data'])
+                            offset += 50
+                        break
+                await asyncio.sleep(LR_RETRY_DELAY)
+
+        if not retrieved_all:
+            offsets = [i for i in range(offset, response['totalNum'], 50)]
+
+            @sleep_and_retry
+            @limits(calls=10, period=1)
+            async def get_owned_batch(offset):
+                async with aiohttp.ClientSession(headers=self.headers) as session:
+                    api_url = f"https://api3.loopring.io/api/v3/user/nft/balances?accountId={accountId}&offset={offset}&limit=50"
                     async with session.get(api_url) as response:
                         if response.status == 200:
                             response = await response.json()
-                            if response['totalNum'] == 0:
-                                retrieved_all = True
-                            else:
-                                data.extend(response['data'])
-                            offset += 50
-                            break
-                    await asyncio.sleep(LR_RETRY_DELAY)
+                            return response['data']
+                        else:
+                            return None
+
+            async with aiohttp.ClientSession(headers=self.headers) as session:
+                results = await asyncio.gather(*[get_owned_batch(offset) for offset in offsets])
+                for i in results:
+                    if i is not None:
+                        data.extend(i)
 
         return data
 

@@ -15,23 +15,21 @@ class NiftyDB:
     # GETS
     #############################
 
-    def get_user_info(self, conn=None, accountId=None, address=None, username=None):
-        if conn is None:
-            conn = self.db.connect()
+    def get_user_info(self, accountId=None, address=None, username=None):
+        with self.db.connect() as conn:
+            if address is not None:
+                result = conn.execute(text("SELECT * FROM users WHERE address=:address"), address=address)
+            elif accountId is not None:
+                result = conn.execute(text("SELECT * FROM users WHERE accountId=:accountId"), accountId=accountId)
+            elif username is not None:
+                result = conn.execute(text("SELECT * FROM users WHERE username=:username"), username=username)
 
-        if address is not None:
-            result = conn.execute(text("SELECT * FROM users WHERE address=:address"), address=address)
-        elif accountId is not None:
-            result = conn.execute(text("SELECT * FROM users WHERE accountId=:accountId"), accountId=accountId)
-        elif username is not None:
-            result = conn.execute(text("SELECT * FROM users WHERE username=:username"), username=username)
+            result = result.fetchone()
 
-        result = result.fetchone()
-
-        if result is None:
-            return None, None, None
-        else:
-            return result['accountid'], result['address'], result['username']
+            if result is None:
+                return None, None, None
+            else:
+                return result['accountid'], result['address'], result['username']
 
     def get_discord_server_stats(self, serverId):
         with self.db.connect() as conn:
@@ -282,6 +280,19 @@ class NiftyDB:
             else:
                 return result['buyeraccount']
 
+    def get_mint_price(self, nft_id):
+        with self.db.connect() as conn:
+            if len(nft_id) == 36:
+                nft = conn.execute(text("SELECT nftData FROM nfts WHERE nftId=:nft_id"), nft_id=nft_id).fetchone()
+                nftData = nft['nftdata']
+            else:
+                nftData = nft_id
+            first_sale = conn.execute(text("SELECT price FROM transactions WHERE nftData=:nftData AND txType IN ('SpotTrade', 'Transfer') ORDER BY blockId ASC LIMIT 1"), nftData=nftData).fetchone()
+            if first_sale is None:
+                return None
+            else:
+                return first_sale['price']
+
 
 
     #############################
@@ -308,6 +319,15 @@ class NiftyDB:
                 logging.error(f"Error updating numNfts for {collectionId}: {e} {traceback.format_exc()}")
                 return False
 
+    def update_mint_price(self, nftId, price):
+        with self.db.connect() as conn:
+            try:
+                conn.execute(text("UPDATE nfts SET mintPrice=:price WHERE nftId=:nftId"),
+                             price=price, nftId=nftId)
+                return True
+            except Exception as e:
+                logging.error(f"Error updating mint price for {nftId}: {e} {traceback.format_exc()}")
+                return False
 
     #############################
     # INSERTS
