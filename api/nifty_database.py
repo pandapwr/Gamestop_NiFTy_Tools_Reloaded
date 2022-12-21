@@ -1,8 +1,9 @@
 from sqlalchemy import create_engine, text
 from sqlalchemy.pool import NullPool
-from config import *
+from .config import *
 import logging
 import traceback
+import pandas as pd
 
 
 class NiftyDB:
@@ -391,6 +392,20 @@ class NiftyDB:
                 logging.error(f"Error inserting transaction for {nftData}: {e} {traceback.format_exc()}")
                 return False
 
+    def insert_transactions(self, transactions):
+        with self.db.connect() as conn:
+            try:
+                query = "INSERT INTO transactions (blockId, createdAt, txType, nftData, sellerAccount, buyerAccount, amount, price, priceUsd) VALUES "
+                for transaction in transactions:
+                    query += f"({transaction[0]}, {transaction[1]}, '{transaction[2]}', '{transaction[3]}', {transaction[4]}, {transaction[5]}, {transaction[6]}, {transaction[7]}, {transaction[8]}),"
+                query = query[:-1]
+
+                conn.execute(text(query))
+                return True
+            except Exception as e:
+                logging.error(f"Error inserting transactions: {e} {traceback.format_exc()}")
+                return False
+
     def insert_discord_server_stats(self, serverId, serverName, timestamp, num_members, num_online):
         with self.db.connect() as conn:
             try:
@@ -413,6 +428,16 @@ class NiftyDB:
             except Exception as e:
                 logging.error(f"Error inserting collection for {collectionId}: {e} {traceback.format_exc()}")
                 return False
+
+    def insert_historical_price_data(self, currency, dataFrame):
+        with self.db.connect() as conn:
+            for index in dataFrame.index:
+                timestamp = (dataFrame['time'][index] - pd.Timestamp("1970-01-01")) // pd.Timedelta('1s')
+                datetime = dataFrame['time'][index].strftime('%Y-%m-%d %H:%M:%S')
+                price = dataFrame['open'][index]
+                conn.execute(text("INSERT INTO historical_crypto_prices VALUES (:timestamp, :datetime, :currency, :price)"), timestamp=timestamp, datetime=datetime, currency=currency, price=price)
+                print(f"Inserted {timestamp} {datetime} | {currency}-USD: ${price}")
+
 
     #############################
     # CHECKS

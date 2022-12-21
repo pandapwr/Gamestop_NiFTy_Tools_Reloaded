@@ -5,10 +5,10 @@ import asyncio
 import logging
 import time
 from concurrent.futures import ThreadPoolExecutor
-from config import *
+from .config import *
 from datetime import datetime
-from nifty_database import NiftyDB
-from loopring_api import LoopringAPI
+from .nifty_database import NiftyDB
+from .loopring_api import LoopringAPI
 import traceback
 
 GS_HEADERS = {
@@ -18,7 +18,28 @@ GS_HEADERS = {
 
 class GamestopApi:
     def __init__(self):
-        pass
+        self.gas_price = 0
+        self.eth_fee = 0
+        self.eth_usd = 0
+
+    @classmethod
+    async def load(cls):
+        self = cls()
+        await self.get_exchange_rate()
+        return self
+
+    async def get_exchange_rate(self):
+        api_url = "https://api.nft.gamestop.com/nft-svc-marketplace/ratesAndFees"
+        async with aiohttp.ClientSession(headers=GS_HEADERS) as session:
+            async with session.get(api_url) as response:
+                if response.status == 200:
+                    response = await response.json()
+                    self.gas_price = response['gasPrice']
+                    self.eth_fee = response['ethFee']
+                    self.eth_usd = response['rates'][0]['quotes'][0]['rate']
+                    return self.eth_usd
+                else:
+                    return None
 
     async def get_newest_collections(self, limit=48):
         """
@@ -238,9 +259,6 @@ class NftCollection:
                 offsets = [i for i in range(0, num_items, 500)]
                 nfts = []
 
-                def wrapper(coro):
-                    return asyncio.run(coro)
-
                 async def get_nft_batch(offset):
                     async with aiohttp.ClientSession(headers=GS_HEADERS) as req:
                         api_url = ("https://api.nft.gamestop.com/nft-svc-marketplace/getNftsPaginated?"
@@ -251,13 +269,14 @@ class NftCollection:
                                 data = await data.json()
                                 return data['data']
 
-                with ThreadPoolExecutor(max_workers=16) as executor:
-                    batches = [get_nft_batch(offset) for offset in offsets]
-                    for r in executor.map(wrapper, batches):
-                        nfts.extend(r)
+                results = await asyncio.gather(*[get_nft_batch(offset) for offset in offsets])
+                for i in results:
+                    if i is not None:
+                        nfts.extend(i)
+
             else:
                 api_url = ("https://api.nft.gamestop.com/nft-svc-marketplace/getNftsPaginated?"
-                           f"nativeLayer=Loopring&limit={limit}&offset={offset}&collectionId={self.collectionID}"
+                           f"nativeLayer=Loopring&limit={limit}&offset={offset}&collectionId={self.collectionId}"
                            f"&sortBy={sort}&sortOrder={sort_order}")
                 async with session.get(api_url) as response:
                     if response.status == 200:
@@ -421,24 +440,24 @@ class Nft:
         """
         # Query database to see if NFT is already cached
         db = NiftyDB()
-        db_data = await db.get_nft_data(self.nft_id)
+        db_data = db.get_nft_data(self.nft_id)
 
         if db_data is not None and self.get_all_data is False:
             data = dict()
-            data['nftId'] = db_data['nftId']
+            data['nftId'] = db_data['nftid']
             data['name'] = db_data['name']
-            data['nftData'] = db_data['nftData']
-            data['tokenId'] = db_data['tokenId']
-            data['contractAddress'] = db_data['contractAddress']
-            data['creatorEthAddress'] = db_data['creatorEthAddress']
+            data['nftData'] = db_data['nftdata']
+            data['tokenId'] = db_data['tokenid']
+            data['contractAddress'] = db_data['contractaddress']
+            data['creatorEthAddress'] = db_data['creatorethaddress']
             data['attributes'] = json.loads(db_data['attributes'])
             data['amount'] = db_data['amount']
-            data['collectionId'] = db_data['collectionId']
-            data['createdAt'] = db_data['createdAt']
-            data['updatedAt'] = db_data['updatedAt']
-            data['firstMintedAt'] = db_data['firstMintedAt']
-            data['thumbnailUrl'] = db_data['thumbnailUrl']
-            data['mintPrice'] = db_data['mintPrice']
+            data['collectionId'] = db_data['collectionid']
+            data['createdAt'] = db_data['createdat']
+            data['updatedAt'] = db_data['updatedat']
+            data['firstMintedAt'] = db_data['firstmintedat']
+            data['thumbnailUrl'] = db_data['thumbnailurl']
+            data['mintPrice'] = db_data['mintprice']
             self.on_gs_nft = True
             self.from_db = True
 
@@ -545,7 +564,7 @@ class Nft:
             order['sellerName'] = user.username
 
             if user.username not in orderbook:
-                num_owned = user.get_nft_number_owned(self.get_nft_data(), use_lr=True)
+                num_owned = await user.get_nft_number_owned(self.get_nft_data(), use_lr=True)
                 if num_owned is None:
                     num_owned = 0
             else:
@@ -559,7 +578,7 @@ class Nft:
             else:
                 orderbook[order['sellerName']].append(order)
 
-        with ThreadPoolExecutor(max_workers=5) as executor:
+        with ThreadPoolExecutor(max_workers=4) as executor:
             futures = [fetch_owned_nfts(idx, order) for idx, order in enumerate(orders)]
             executor.map(wrapper, futures)
 
@@ -610,9 +629,19 @@ class Nft:
                      'amount': order['amount'],
                      'price': order['pricePerNft']})
 
-        def get_username(address):
-            user = User(address=address)
+        async def get_username(address):
+            user = await User.load(address=address)
             return [address, user.username, 2]
+
+        results = await asyncio.gather(*[get_username(address) for address in sellers.keys()])
+        for result in results:
+            sellers[result[0]]['username'] = result[1]
+            sellers[result[0]]['num_owned'] = result[2]
+
+        self.sellers = sellers
+        return sellers
+
+
 
         with ThreadPoolExecutor(max_workers=50) as executor:
             futures = [executor.submit(get_username, address) for address in sellers.keys()]
@@ -620,8 +649,8 @@ class Nft:
                 sellers[future.result()[0]]['username'] = future.result()[1]
                 sellers[future.result()[0]]['number_owned'] = future.result()[2]
 
-        self.sellers = sellers
-        return sellers
+
+
 
     '''
     Functions for returning NFT information
@@ -663,10 +692,10 @@ class Nft:
     def get_updated_datetime(self):
         return self.data['updatedAt']
 
-    def get_state(self):
+    async def get_state(self):
         if self.get_all_data is False:
             self.get_all_data = True
-            self.data = self.get_nft_info()
+            self.data = await self.get_nft_info()
         return self.data['state']
 
     def get_url(self):
@@ -702,23 +731,18 @@ class Nft:
 
 
 class User:
-    def __init__(self):
+    def __init__(self, username=None, address=None, accountId=None, get_nfts=False, check_new_name=False, new_user=False):
         self.username = None
         self.address = None
         self.accountId = None
         self.created_collections = []
         self.owned_nfts = []
         self.number_of_nfts = 0
-
-    @classmethod
-    async def load(cls, username=None, address=None, accountId=None, get_nfts=False, get_collections=False, check_new_name=False):
-        self = cls()
-
+        self.check_new_name = check_new_name
         if username is None and address is None and accountId is None:
-            return None
+            print("No username/address/accountId provided")
 
         db = NiftyDB()
-        lr = LoopringAPI()
         if not check_new_name:
             if address is not None:
                 self.accountId, self.address, self.username = db.get_user_info(address=address)
@@ -727,21 +751,22 @@ class User:
             else:
                 self.accountId, self.address, self.username = db.get_user_info(username=username)
 
-        if self.accountId is None:
-            if username is not None:
-                await self.get_user_profile(username=username, updateDb=True, check_new_name=check_new_name)
-            elif address is not None:
-                await self.get_user_profile(address=address, updateDb=True, check_new_name=check_new_name)
-            elif accountId is not None:
-                address = await lr.get_user_address(accountId)
-                await self.get_user_profile(address=address, updateDb=True, check_new_name=check_new_name)
-
-        if get_collections:
-            self.number_of_collections = self.get_created_collections()
         if get_nfts:
             self.owned_nfts = self.get_owned_nfts()
 
+    async def load(self, username=None, address=None, accountId=None):
+        lr = LoopringAPI()
+        if username is not None:
+            await self.get_user_profile(username=username, updateDb=True, check_new_name=self.check_new_name)
+        elif address is not None:
+            await self.get_user_profile(address=address, updateDb=True, check_new_name=self.check_new_name)
+        elif accountId is not None:
+            address = await lr.get_user_address(accountId)
+            await self.get_user_profile(address=address, updateDb=True, check_new_name=self.check_new_name)
+
         return self
+
+
 
     async def get_user_profile(self, username=None, address=None, updateDb=False, check_new_name=False):
         """
@@ -783,11 +808,11 @@ class User:
         if check_new_name:
             if len(self.username) != 42:
                 print(f"Found username for {self.address}: {self.username}, updating database")
-                await db.update_username(accountId=self.accountId, username=self.username)
+                db.update_username(accountId=self.accountId, username=self.username)
         else:
             if updateDb:
-                await db.insert_user_info(accountId=self.accountId, address=self.address, username=self.username,
-                                         discord_username=None)
+                db.insert_user_info(accountId=self.accountId, address=self.address, username=self.username,
+                                          discord_username=None)
 
         return
 
@@ -902,5 +927,12 @@ class User:
             return self.username
 
 
+async def main():
+    time_start = time.time()
+    collection = await NftCollection.load("36fab6f7-1e51-49d9-a0be-39343abafd0f", get_collection_nfts=True)
+    print(len(collection.collection_nfts))
+
+    print(f"Time elapsed: {time.time() - time_start}")
+
 if __name__ == "__main__":
-    pass
+    asyncio.run(main())

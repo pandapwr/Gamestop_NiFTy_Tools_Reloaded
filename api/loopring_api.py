@@ -4,11 +4,12 @@ import logging
 from ratelimit import limits, sleep_and_retry
 from datetime import datetime
 import traceback
+import requests
 import asyncio
-import time
-from nifty_database import NiftyDB
 from random import choice
-from config import *
+import time
+from .nifty_database import NiftyDB
+from .config import *
 
 
 class LoopringAPI:
@@ -59,6 +60,8 @@ class LoopringAPI:
             logging.error(f"Error getting number of NFT holders: {response.status}")
             return None
 
+    @sleep_and_retry
+    @limits(calls=5, period=1)
     async def get_user_address(self, accountId):
         """
         Get the user's address from their accountId
@@ -68,14 +71,19 @@ class LoopringAPI:
         """
         async with aiohttp.ClientSession(headers=self.headers) as session:
             api_url = f"https://api3.loopring.io/api/v3/account?accountId={accountId}"
-            async with session.get(api_url) as response:
-                if response.status == 200:
-                    response = await response.json()
-                    return response['address']
-                else:
-                    logging.error(f"Error getting user address: {response.status}")
-                    return None
+            for i in range(LR_RETRY_ATTEMPTS):
+                async with session.get(api_url) as response:
+                    if response.status == 200:
+                        response = await response.json()
+                        return response['owner']
+                    else:
+                        logging.error(f"Error getting user address: {response.status}")
+                        await asyncio.sleep(LR_RETRY_DELAY)
+                        continue
+            return None
 
+    @sleep_and_retry
+    @limits(calls=5, period=1)
     async def get_accountId_from_address(self, address):
         """
         Get the user's accountId from their address
@@ -84,7 +92,7 @@ class LoopringAPI:
         :rtype: str
         """
         async with aiohttp.ClientSession(headers=self.headers) as session:
-            api_url = f"https://api3.loopring.io/api/v3/account?address={address}"
+            api_url = f"https://api3.loopring.io/api/v3/account?owner={address}"
             async with session.get(api_url) as response:
                 if response.status == 200:
                     response = await response.json()
@@ -188,11 +196,10 @@ class LoopringAPI:
                         else:
                             return None
 
-            async with aiohttp.ClientSession(headers=self.headers) as session:
-                results = await asyncio.gather(*[get_owned_batch(offset) for offset in offsets])
-                for i in results:
-                    if i is not None:
-                        data.extend(i)
+            results = await asyncio.gather(*[get_owned_batch(offset) for offset in offsets])
+            for i in results:
+                if i is not None:
+                    data.extend(i)
 
         return data
 
@@ -205,14 +212,32 @@ class LoopringAPI:
         :return: Block details
         :rtype: dict
         """
-        async with aiohttp.ClientSession(headers=self.headers) as session:
-            api_url = f"https://api3.loopring.io/api/v3/block/getBlock?blockId={blockId}"
-            async with session.get(api_url) as response:
-                if response.status == 200:
-                    response = await response.json()
-                    return response
+
+        async with aiohttp.ClientSession(headers=self.headers) as lr_block:
+            api_url = f"https://api3.loopring.io/api/v3/block/getBlock?id={blockId}"
+            async with lr_block.get(api_url) as lr_response:
+                if lr_response.status == 200:
+                    lr_response = await lr_response.json()
+                    return lr_response
                 else:
-                    logging.error(f"Error getting block details: {response.status}")
+                    logging.error(f"Error getting block details: {lr_response.status}")
+                    return None
+
+    async def get_latest_block(self):
+        """
+        Get the latest block details
+        :return: Block details
+        :rtype: dict
+        """
+
+        async with aiohttp.ClientSession(headers=self.headers) as lr_block:
+            api_url = f"https://api3.loopring.io/api/v3/block/getBlock"
+            async with lr_block.get(api_url) as lr_response:
+                if lr_response.status == 200:
+                    lr_response = await lr_response.json()
+                    return lr_response['blockId']
+                else:
+                    logging.error(f"Error getting latest block: {lr_response.status}")
                     return None
 
     async def get_pending(self, spot_trades=True, transfers=True, mints=True):
@@ -288,8 +313,10 @@ class LoopringAPI:
 
         nf = NiftyDB()
 
-        block_price_eth = await nf.get_historical_price('ETH', int(blockData['createdAt'] / 1000))
-        block_price_lrc = await nf.get_historical_price('LRC', int(blockData['createdAt'] / 1000))
+        block_price_eth = nf.get_historical_price('ETH', int(blockData['createdAt'] / 1000))
+        block_price_lrc = nf.get_historical_price('LRC', int(blockData['createdAt'] / 1000))
+        blockData['blockId'] = int(blockData['blockId'])
+
         if block_price_eth is None or block_price_lrc is None:
             logging.error(f"Error getting historical price for block {blockData['blockId']}")
             return None
@@ -299,9 +326,13 @@ class LoopringAPI:
             return None
 
         created = int(blockData['createdAt'] / 1000)
+        time_start = time.time()
+        transactions = []
+
+        if len(blockData['transactions']) == 0:
+            return
         for tx in blockData['transactions']:
             if tx['txType'] == 'SpotTrade':
-                # Check to see if transaction was done using LRC
                 if tx['orderA']['tokenS'] == 1:
                     price_lrc = float(tx['orderA']['amountS']) / 10 ** 18 / float(tx['orderA']['amountB'])
                     price_usd = round(price_lrc * block_price_lrc, 2)
@@ -309,19 +340,24 @@ class LoopringAPI:
                 else:
                     price_eth = float(tx['orderA']['amountS']) / 10 ** 18 / float(tx['orderA']['amountB'])
                     price_usd = round(price_eth * block_price_eth, 2)
-                nf.insert_transaction(blockData['blockId'], created, tx['txType'],
-                                      tx['orderA']['nftData'], tx['orderB']['accountID'], tx['orderA']['accountID'],
-                                      tx['orderB']['fillS'], price_eth, price_usd)
+                transactions.append([blockData['blockId'], created, tx['txType'],
+                                          tx['orderA']['nftData'], tx['orderB']['accountID'], tx['orderA']['accountID'],
+                                          tx['orderB']['fillS'], price_eth, price_usd])
             elif tx['txType'] == 'Transfer':
-                nf.insert_transaction(blockData['blockId'], created, tx['txType'],
-                                      tx['token']['nftData'], tx['accountId'], tx['toAccountId'],
-                                      tx['token']['amount'], 0, 0)
+                transactions.append([blockData['blockId'], created, tx['txType'], tx['token']['nftData'],
+                                     tx['accountId'], tx['toAccountId'], tx['token']['amount'], 0, 0])
             elif tx['txType'] == 'NftMint':
-                nf.insert_transaction(blockData['blockId'], created, tx['txType'],
-                                      tx['nftToken']['nftData'], tx['minterAccountId'], tx['toAccountId'],
-                                      tx['nftToken']['amount'], 0, 0)
+                transactions.append([blockData['blockId'], created, tx['txType'], tx['nftToken']['nftData'],
+                                     tx['minterAccountId'], tx['toAccountId'], tx['nftToken']['amount'], 0, 0])
 
-        print(f"Saved block {blockData['blockId']} to database")
+        nf.insert_transactions(transactions)
+
+        time_end = time.time()
+        print(f"Saved block {blockData['blockId']} ({len(blockData['transactions'])} tx) to database in {round(time_end - time_start, 2)} seconds")
+        return True
+
+
+
 
     async def get_nft_info(self, nftData):
         """
